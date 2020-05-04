@@ -102,6 +102,16 @@ query: |
   SecEvents 
   | project TimeGenerated, EventID, Computer, SubjectUserSid, Account, AccountType, Process, NewProcessName, CommandLine, ParentProcessName
   ) on Computer, Process
+  // removing common items that may still show up in small environments, add here is you have additional exclusions
+  | where NewProcessName !endswith ':\\Windows\\System32\\conhost.exe' and ParentProcessName !endswith ':\\Windows\\System32\\conhost.exe'
+  | where ParentProcessName !endswith ':\\Windows\\System32\\wuauclt.exe' and NewProcessName !startswith 'C:\\Windows\\SoftwareDistribution\\Download\\Install\\AM_Delta_Patch_'
+  | where ParentProcessName !has ':\\WindowsAzure\\GuestAgent_' and NewProcessName !has ':\\WindowsAzure\\GuestAgent_'
+  | where ParentProcessName !has ':\\WindowsAzure\\WindowsAzureNetAgent_' and NewProcessName !has ':\\WindowsAzure\\WindowsAzureNetAgent_'
+  | where ParentProcessName !has ':\\ProgramData\\Microsoft\\Windows Defender\\platform\\'
+  | where NewProcessName !has ':\\ProgramData\\Microsoft\\Windows Defender\\platform\\'
+  | where NewProcessName !has ':\\Windows\\Microsoft.NET\\Framework' and not(NewProcessName endswith '\\ngentask.exe' or NewProcessName endswith '\\ngen.exe') and not(ParentProcessName endswith ':\\Windows\\System32\\taskhostw.exe')
+  | where NewProcessName !endswith '\\MpSigStub.exe' and ParentProcessName !has ':\\Windows\\SoftwareDistribution\\Download\\Install\\'
+  | where ParentProcessName !has ':\\Program Files\\Microsoft Monitoring Agent\\Agent\\MonitoringHost.exe'
   | project TimeGenerated, EventID, Computer, SubjectUserSid, Account, AccountType, Weight, AdjustedProcessEntropy, FullDecimalProcessEntropy = ProcessEntropy, 
   Process, NewProcessName, CommandLine, ParentProcessName, TotalProcessCountOnHost, ProcessCountOnHost, DistinctComputersWithProcessCount
   | sort by Weight asc, AdjustedProcessEntropy asc, NewProcessName asc
