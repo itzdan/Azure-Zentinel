@@ -16,54 +16,77 @@ tactics:
   - Execution
 query: |
 
-  // May need to reduce the number of days if the environment is very large.  Try 3-5 days, but less accuracy.
+  // exclude when over # of machines have the process
+  let excludeThreshold = 10;
+  // exclude when more than percent (default 10%)
+  let ratioHighCount = 0.1;
+  // exclude when less than percent (default 3%)
+  let ratioMidCount = 0.03;
+  // Process count limit in one day, perf improvement (default every minute for 24 hours - 60*24 = 1440)
+  let procLimit = 60*24;
   let end = startofday(now());
+  // May need to reduce the number of days if the environment is very large.  Try 1-3 days, but less accuracy.
   let start = end - 7d;
-  let Exclude = SecurityEvent
-  // Timeframe is set so that results do not change during the same day (UTC time)
+  let SecEvents = SecurityEvent
+  // Timeframe is set so that results do not change during the same day
   | where TimeGenerated >= start and TimeGenerated <= end
-  | where EventID == 4688
-  | summarize ExcludeCompCount = dcount(Computer),  ExcludeProcCount = count() by Process 
+  | where EventID == 4688;
+  let Exclude = SecEvents
+  | summarize StartTime = min(TimeGenerated), EndTime = max(TimeGenerated), ExcludeCompCount = dcount(Computer), ExcludeProcCount = count() by Process
+  // Removing general limit for noise in one day
+  | extend timediff = iff(datetime_diff('day', EndTime, StartTime) > 0, datetime_diff('day', EndTime, StartTime), 1)
+  // Default exclude of 1440 (1 per min) or more executions in 24 hours on a given machine
+  | where ExcludeProcCount < procLimit*timediff
   // Removing noisy processes for an environment, adjust as needed
-  | where ExcludeProcCount >= 2000 and ExcludeCompCount > 2
-  ;
-  let AllSecEvents = SecurityEvent
-  | where TimeGenerated >= start and TimeGenerated <= end
-  | where EventID == 4688
-  // excluding well known processes
-  | where NewProcessName !endswith ':\\Windows\\System32\\conhost.exe' and ParentProcessName !endswith ':\\Windows\\System32\\conhost.exe'
-  | where ParentProcessName !endswith ":\\Windows\\System32\\wuauclt.exe" and NewProcessName !startswith "C:\\Windows\\SoftwareDistribution\\Download\\Install\\AM_Delta_Patch_"
-  | where ParentProcessName !has ":\\WindowsAzure\\GuestAgent_" and NewProcessName !has ":\\WindowsAzure\\GuestAgent_"
-  | where ParentProcessName !has ":\\WindowsAzure\\WindowsAzureNetAgent_" and NewProcessName !has ":\\WindowsAzure\\WindowsAzureNetAgent_"
-  | where ParentProcessName !has ":\\ProgramData\\Microsoft\\Windows Defender\\platform\\" and ParentProcessName !endswith "\\MpCmdRun.exe" 
+  | extend compRatio = ExcludeCompCount/toreal(ExcludeProcCount)
+  | where compRatio == 0 or (ExcludeCompCount > excludeThreshold and compRatio < ratioHighCount) or (ExcludeCompCount between (2 .. excludeThreshold) and compRatio < ratioMidCount);
+  let AllSecEvents = SecEvents
+  // Removing general limit for noise in one day
+  | summarize StartTime = min(TimeGenerated), EndTime = max(TimeGenerated), procCount = count() by Computer, Process
+  | extend timediff = iff(datetime_diff('day', EndTime, StartTime) > 0, datetime_diff('day', EndTime, StartTime), 1)
+  // Default include the 1440 (1 per min) or more executions in 24 hours on a given machine to remove them from overall comparison list
+  | where procCount > procLimit*timediff
+  | join kind= rightanti ( 
+  SecEvents | project Computer, Process
+  ) on Computer, Process
   | project Computer, Process;
   // Removing noisy process from full list
-  let Include = Exclude | join kind= rightanti (
+  let Include = materialize(Exclude
+  | join kind= rightanti (
   AllSecEvents
-  ) on Process;
+  ) on Process);
   // Identifying prevalence for a given process in the environment
-  let DCwPC = Include | summarize DistinctComputersWithProcessCount = dcount(Computer) by Process
+  let DCwPC = materialize(Include
+  | summarize DistinctComputersWithProcessCount = dcount(Computer) by Process
   | join kind=inner (
-  Include 
+  Include
   ) on Process
-  | distinct Computer, Process, DistinctComputersWithProcessCount;
+  | distinct Computer, Process, DistinctComputersWithProcessCount);
   // Getting the Total process count on each host to use as the denominator in the entropy calc
-  let TPCoH = Include | summarize TotalProcessCountOnHost = count(Process) by Computer
+  let TPCoH = materialize(Include
+  | summarize TotalProcessCountOnHost = count(Process) by Computer
   | join kind=inner (
-  Include 
+  Include
   ) on Computer
   | distinct Computer, Process, TotalProcessCountOnHost
   //Getting a decimal value for later computation
-  | extend TPCoHValue = todecimal(TotalProcessCountOnHost);
+  | extend TPCoHValue = todecimal(TotalProcessCountOnHost));
   // Need the count of each class in my bucket or also said as count of ProcName(Class) per Host(Bucket) for use in the entropy calc
-  let PCoH = Include | summarize ProcessCountOnHost = count(Process) by Computer, Process
+  let PCoH = Include
+  | summarize ProcessCountOnHost = count(Process) by Computer, Process
   | join kind=inner (
   Include
   ) on Computer,Process
   | distinct Computer, Process, ProcessCountOnHost
   //Getting a decimal value for later computation
   | extend PCoHValue = todecimal(ProcessCountOnHost);
-  let Combined = DCwPC | join ( TPCoH ) on Computer, Process | join ( PCoH ) on Computer, Process; 
+  let Combined = DCwPC
+  | join (
+  TPCoH
+  ) on Computer, Process
+  | join (
+  PCoH
+  ) on Computer, Process;
   let Results = Combined
   // Entropy calculation
   | extend ProcessEntropy = -log2(PCoHValue/TPCoHValue)*(PCoHValue/TPCoHValue)
@@ -71,22 +94,16 @@ query: |
   // Calculating Weight, see details in description
   | extend Weight = toreal((ProcessEntropy*10000)*ProcessCountOnHost*DistinctComputersWithProcessCount)
   // Remove or increase value to see processes with low entropy, meaning more common.
-  | where Weight <= 75
+  | where Weight <= 100
   | project Computer, Process, Weight , ProcessEntropy, TotalProcessCountOnHost, ProcessCountOnHost, DistinctComputersWithProcessCount, AdjustedProcessEntropy;
   // Join back full entry
-  Results | join kind= inner (
-      SecurityEvent
-      | where TimeGenerated >= start and TimeGenerated <= end
-      | where EventID == 4688
-      // excluding well known processes
-      | where NewProcessName !endswith ':\\Windows\\System32\\conhost.exe' and ParentProcessName !endswith ':\\Windows\\System32\\conhost.exe'
-      | where ParentProcessName !endswith ":\\Windows\\System32\\wuauclt.exe" and NewProcessName !startswith "C:\\Windows\\SoftwareDistribution\\Download\\Install\\AM_Delta_Patch_"
-      | where ParentProcessName !has ":\\WindowsAzure\\GuestAgent_" and NewProcessName !has ":\\WindowsAzure\\GuestAgent_"
-      | where ParentProcessName !has ":\\WindowsAzure\\WindowsAzureNetAgent_" and NewProcessName !has ":\\WindowsAzure\\WindowsAzureNetAgent_"
-      | where ParentProcessName !has ":\\ProgramData\\Microsoft\\Windows Defender\\platform\\" and ParentProcessName !endswith "\\MpCmdRun.exe" 
-      | project TimeGenerated, EventID, Computer, SubjectUserSid, Account, AccountType, Process, NewProcessName, CommandLine, ParentProcessName
+  Results
+  | join kind= inner (
+  SecEvents 
+  | project TimeGenerated, EventID, Computer, SubjectUserSid, Account, AccountType, Process, NewProcessName, CommandLine, ParentProcessName
   ) on Computer, Process
-  | project TimeGenerated, EventID, Computer, SubjectUserSid, Account, Weight, AdjustedProcessEntropy, FullDecimalProcessEntropy = ProcessEntropy, Process, NewProcessName, CommandLine, ParentProcessName, TotalProcessCountOnHost, ProcessCountOnHost, DistinctComputersWithProcessCount
+  | project TimeGenerated, EventID, Computer, SubjectUserSid, Account, AccountType, Weight, AdjustedProcessEntropy, FullDecimalProcessEntropy = ProcessEntropy, 
+  Process, NewProcessName, CommandLine, ParentProcessName, TotalProcessCountOnHost, ProcessCountOnHost, DistinctComputersWithProcessCount
   | sort by Weight asc, AdjustedProcessEntropy asc, NewProcessName asc
   | extend timestamp = TimeGenerated, HostCustomEntity = Computer, AccountCustomEntity = Account
   
